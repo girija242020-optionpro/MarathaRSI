@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="theme-color" content="#0f172a">
+    <title>RSI Signal Engine</title>
+    <style>
+        :root { --bg: #0f172a; --card: #1e293b; --text: #f8fafc; --accent: #3b82f6; --green: #22c55e; --red: #ef4444; }
+        body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; padding: 10px; display: flex; justify-content: center; min-height: 100vh; }
+        .container { width: 100%; max-width: 480px; }
+        .header { display: flex; justify-content: space-between; align-items: center; padding: 15px; background: var(--card); border-radius: 12px; margin-bottom: 15px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); }
+        .status { font-size: 12px; padding: 4px 8px; border-radius: 4px; background: #334155; }
+        .status.connected { background: var(--green); color: white; }
+        .signal-card { background: var(--card); border-radius: 12px; padding: 20px; margin-bottom: 15px; border: 1px solid #334155; transition: all 0.3s; }
+        .signal-card.active { border-color: var(--green); box-shadow: 0 0 15px rgba(34, 197, 94, 0.2); }
+        .signal-type { font-size: 32px; font-weight: 800; color: var(--green); text-align: center; margin-bottom: 10px; }
+        .signal-meta { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; font-size: 14px; color: #94a3b8; }
+        .meta-item span { display: block; color: white; font-weight: bold; }
+        .controls { background: var(--card); padding: 15px; border-radius: 12px; }
+        button, select { width: 100%; padding: 12px; border: none; border-radius: 8px; font-weight: bold; margin-bottom: 10px; }
+        button { cursor: pointer; }
+        .btn-sound { background: #334155; color: white; }
+        .btn-sound.active { background: var(--accent); }
+        select { background: #334155; color: white; }
+        .debug { font-size: 10px; color: #94a3b8; margin-top: 20px; font-family: monospace; overflow-wrap: anywhere; }
+        .note { font-size: 12px; color: #fbbf24; line-height: 1.5; margin-top: 12px; }
+    </style>
+</head>
+<body>
+<div class="container">
+    <div class="header">
+        <div>
+            <h2 style="margin:0;">RSI CALL Engine</h2>
+            <small>NIFTY / SENSEX Universal</small>
+        </div>
+        <div id="status" class="status">DISCONNECTED</div>
+    </div>
+
+    <div id="signalCard" class="signal-card">
+        <div id="signalType" style="display:none;" class="signal-type">CALL / CE</div>
+        <div id="signalMeta" class="signal-meta" style="display:none;">
+            <div class="meta-item">RSI <span id="valRsi">-</span></div>
+            <div class="meta-item">RSI SMA <span id="valRsiSma">-</span></div>
+            <div class="meta-item">DEMA <span id="valDema">-</span></div>
+            <div class="meta-item">Vol <span id="valVol">-</span></div>
+        </div>
+    </div>
+
+    <div class="controls">
+        <button id="btnSound" class="btn-sound" type="button">🔇 Enable Sound</button>
+        <select id="symbolSelect" aria-label="Select index">
+            <option value="NIFTY">NIFTY 50</option>
+            <option value="SENSEX">SENSEX</option>
+        </select>
+    </div>
+
+    <div class="note">Demo logic warning: the supplied script uses placeholder DEMA and volume thresholds. Do not treat signals as live-trading confirmations until the data format and indicator logic are corrected.</div>
+    <div class="debug" id="debugLog">Waiting for connection...</div>
+</div>
+
+<script>
+    // Set this to your deployed backend WebSocket URL (for example, wss://your-backend.onrender.com).
+    // When served locally, defaults to ws://localhost:3001.
+    // After deploying the backend to Render, replace the hostname below with your real Render service URL.
+    // Example: const BACKEND_URL = "wss://your-service-name.onrender.com";
+    const BACKEND_URL = "wss://REPLACE-WITH-YOUR-RENDER-SERVICE.onrender.com";
+
+    let ws = null;
+    let soundEnabled = false;
+    let audioCtx = null;
+    let selectedSymbol = 'NIFTY';
+    let reconnectTimer = null;
+
+    const STATES = {
+        WAITING_OVERSOLD: 'WAITING_FOR_OVERSOLD',
+        WAITING_CROSS_SMA: 'WAITING_FOR_RSI_SMA_CROSS',
+        WAITING_CROSS_30: 'WAITING_FOR_RSI_30_CROSS',
+        WAITING_FILTERS: 'WAITING_FOR_CONFIRMATION_FILTERS',
+        CONFIRMED: 'CALL_CONFIRMED'
+    };
+
+    let currentState = STATES.WAITING_OVERSOLD;
+    let history = [];
+    let previousRsi = null;
+    let previousRsiSma = null;
+    let signalTimeout = null;
+
+    document.getElementById('btnSound').addEventListener('click', toggleSound);
+    document.getElementById('symbolSelect').addEventListener('change', (event) => {
+        selectedSymbol = event.target.value;
+        currentState = STATES.WAITING_OVERSOLD;
+        history = [];
+        previousRsi = null;
+        previousRsiSma = null;
+        log(`Switched to ${selectedSymbol}; indicator history reset.`);
+    });
+
+    function toggleSound() {
+        soundEnabled = !soundEnabled;
+        const btn = document.getElementById('btnSound');
+        btn.innerText = soundEnabled ? '🔊 Sound On' : '🔇 Enable Sound';
+        btn.classList.toggle('active', soundEnabled);
+        if (soundEnabled) {
+            if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            if (audioCtx.state === 'suspended') audioCtx.resume();
+            playBeep();
+        }
+    }
+
+    function playBeep() {
+        if (!soundEnabled || !audioCtx) return;
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+        osc.frequency.value = 800;
+        gain.gain.setValueAtTime(0.1, audioCtx.currentTime);
+        osc.start();
+        osc.stop(audioCtx.currentTime + 0.1);
+    }
+
+    function calcRSI(data, period = 14) {
+        if (data.length < period + 1) return null;
+        let gains = 0, losses = 0;
+        for (let i = 1; i <= period; i++) {
+            const diff = data[i] - data[i - 1];
+            if (diff > 0) gains += diff;
+            else losses -= diff;
+        }
+        let avgGain = gains / period;
+        let avgLoss = losses / period;
+        for (let i = period + 1; i < data.length; i++) {
+            const diff = data[i] - data[i - 1];
+            avgGain = ((avgGain * (period - 1)) + (diff > 0 ? diff : 0)) / period;
+            avgLoss = ((avgLoss * (period - 1)) + (diff < 0 ? -diff : 0)) / period;
+        }
+        if (avgLoss === 0) return avgGain === 0 ? 50 : 100;
+        if (avgGain === 0) return 0;
+        const rs = avgGain / avgLoss;
+        return 100 - (100 / (1 + rs));
+    }
+
+    function calcSMA(data, period) {
+        if (data.length < period) return null;
+        const slice = data.slice(-period);
+        return slice.reduce((sum, value) => sum + value, 0) / period;
+    }
+
+    function processCandle(candle) {
+        if (!candle || !Number.isFinite(Number(candle.close))) return;
+        history.push(Number(candle.close));
+        if (history.length > 200) history.shift();
+
+        const rsi = calcRSI(history, 14);
+        if (rsi === null) return;
+
+        // Keep an RSI history; SMA must be calculated from RSI values, not closing prices.
+        rsiHistory.push(rsi);
+        if (rsiHistory.length > 200) rsiHistory.shift();
+        const rsiSma = calcSMA(rsiHistory, 9);
+        if (rsiSma === null) {
+            previousRsi = rsi;
+            return;
+        }
+
+        const crossedSmaUp = previousRsi !== null && previousRsi <= previousRsiSma && rsi > rsiSma;
+        const crossed30Up = previousRsi !== null && previousRsi <= 30 && rsi > 30;
+
+        if (currentState === STATES.WAITING_OVERSOLD) {
+            if (rsi < 30 && rsiSma < 30) {
+                currentState = STATES.WAITING_CROSS_SMA;
+                log(`Armed: RSI ${rsi.toFixed(1)} and RSI SMA below 30.`);
+            }
+        } else if (currentState === STATES.WAITING_CROSS_SMA) {
+            if (crossedSmaUp && rsi < 30 && rsiSma < 30) {
+                currentState = STATES.WAITING_CROSS_30;
+                log('RSI crossed above RSI SMA. Waiting for RSI to cross 30.');
+            } else if (rsi > 40) {
+                currentState = STATES.WAITING_OVERSOLD;
+                log('Setup reset: RSI rose above 40 before confirmation.');
+            }
+        } else if (currentState === STATES.WAITING_CROSS_30) {
+            if (crossed30Up) {
+                currentState = STATES.WAITING_FILTERS;
+                log('RSI crossed above 30. Checking confirmation filters.');
+            } else if (rsi < 25) {
+                currentState = STATES.WAITING_OVERSOLD;
+                log('Setup reset: RSI fell below 25.');
+            }
+        } else if (currentState === STATES.WAITING_FILTERS) {
+            // These are placeholders inherited from the supplied script, not valid market filters.
+            const demaPass = Number(candle.close) > 20000;
+            const volPass = Number(candle.volume) > 1000000;
+            if (demaPass && volPass) {
+                triggerSignal(candle, rsi, rsiSma);
+            } else {
+                log('Confirmation failed (placeholder DEMA/volume filters). Setup reset.');
+                currentState = STATES.WAITING_OVERSOLD;
+            }
+        }
+
+        previousRsi = rsi;
+        previousRsiSma = rsiSma;
+    }
+
+    const rsiHistory = [];
+
+    function triggerSignal(candle, rsi, rsiSma) {
+        const card = document.getElementById('signalCard');
+        const typeEl = document.getElementById('signalType');
+        const metaEl = document.getElementById('signalMeta');
+        card.classList.add('active');
+        typeEl.style.display = 'block';
+        metaEl.style.display = 'grid';
+        document.getElementById('valRsi').innerText = rsi.toFixed(2);
+        document.getElementById('valRsiSma').innerText = rsiSma.toFixed(2);
+        document.getElementById('valDema').innerText = 'PASS*';
+        document.getElementById('valVol').innerText = Number(candle.volume).toLocaleString();
+        playBeep();
+        log('SIGNAL CONFIRMED: CALL / CE (demo filters)');
+        if (signalTimeout) clearTimeout(signalTimeout);
+        signalTimeout = setTimeout(() => {
+            card.classList.remove('active');
+            typeEl.style.display = 'none';
+            metaEl.style.display = 'none';
+            currentState = STATES.WAITING_OVERSOLD;
+        }, 10000);
+    }
+
+    function log(message) {
+        document.getElementById('debugLog').innerText = `[${new Date().toLocaleTimeString()}] ${message}`;
+    }
+
+    function extractCandle(message) {
+        const payload = message && message.data;
+        if (!payload) return null;
+        const candidates = [payload.candle, payload, payload.data, payload.tick];
+        for (const item of candidates) {
+            if (item && Number.isFinite(Number(item.close))) return item;
+            if (item && Number.isFinite(Number(item.ltp))) {
+                return { ...item, close: Number(item.ltp), volume: item.volume ?? item.dayVolume ?? 0 };
+            }
+        }
+        return null;
+    }
+
+    function connect() {
+        if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+        try {
+            ws = new WebSocket(BACKEND_URL);
+        } catch (error) {
+            log(`WebSocket creation failed: ${error.message}`);
+            scheduleReconnect();
+            return;
+        }
+
+        ws.onopen = () => {
+            const status = document.getElementById('status');
+            status.innerText = 'CONNECTED';
+            status.classList.add('connected');
+            log(`Connected to backend: ${BACKEND_URL}`);
+        };
+
+        ws.onmessage = (event) => {
+            try {
+                const message = JSON.parse(event.data);
+                const payload = message.data;
+                const symbol = payload?.instrumentName || payload?.symbol || payload?.name;
+                if (symbol && symbol !== selectedSymbol) return;
+                const candle = extractCandle(message);
+                if (candle) processCandle(candle);
+            } catch (error) {
+                log(`Message parse error: ${error.message}`);
+            }
+        };
+
+        ws.onerror = () => log('WebSocket error; check backend URL and server logs.');
+
+        ws.onclose = () => {
+            const status = document.getElementById('status');
+            status.innerText = 'RECONNECTING...';
+            status.classList.remove('connected');
+            scheduleReconnect();
+        };
+    }
+
+    function scheduleReconnect() {
+        if (reconnectTimer) clearTimeout(reconnectTimer);
+        reconnectTimer = setTimeout(connect, 3000);
+    }
+
+    connect();
+</script>
+</body>
+</html>
